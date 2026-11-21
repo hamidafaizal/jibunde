@@ -5,6 +5,7 @@ import { Clock, Send, CheckCircle2, XCircle, ArrowRight, X } from 'lucide-react'
 
 interface Vocabulary {
     id: string;
+    chapter_id: string;
     kanji: string | null;
     kana: string;
     romaji: string;
@@ -13,16 +14,49 @@ interface Vocabulary {
 
 interface TestResult {
     vocab: Vocabulary;
-    timeSpent: number;
     status: 'Cepat' | 'Lambat' | 'Sangat Lambat' | 'Salah';
+    timeSpent: number;
 }
 
-interface FeedbackState {
+interface EssayFeedback {
     isCorrect: boolean;
     status: TestResult['status'];
     timeSpent: number;
     vocab: Vocabulary;
     wasKanji: boolean;
+}
+
+const COMPLETED_CHAPTERS_KEY = 'minnamaster_completed_chapters';
+
+function markChapterCompleted(chapterId?: string) {
+    if (!chapterId) return;
+    try {
+        const raw = localStorage.getItem(COMPLETED_CHAPTERS_KEY);
+        const parsed: string[] = raw ? JSON.parse(raw) : [];
+        if (!parsed.includes(chapterId)) {
+            localStorage.setItem(COMPLETED_CHAPTERS_KEY, JSON.stringify([...parsed, chapterId]));
+        }
+    } catch {
+        // Abaikan jika penyimpanan lokal tidak tersedia
+    }
+}
+
+function shuffleArray<T>(items: T[]): T[] {
+    const arr = [...items];
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+function getPromptFontSize(text: string): string {
+    const len = text.trim().length;
+    if (len <= 2) return 'text-8xl leading-none';
+    if (len <= 5) return 'text-6xl leading-tight';
+    if (len <= 10) return 'text-4xl leading-snug';
+    if (len <= 18) return 'text-3xl leading-snug';
+    return 'text-2xl leading-relaxed';
 }
 
 function normalizeSpaces(text: string): string {
@@ -66,53 +100,55 @@ function getRomajiComparisonKeys(romaji: string): Set<string> {
     return keys;
 }
 
+function normalizeMeaningText(text: string): string {
+    return text
+        .toLowerCase()
+        .replace(/[（(][^）)]*[）)]/g, ' ')
+        .replace(/[~〜]/g, ' ')
+        .replace(/-/g, ' ')
+        .replace(/[.,\/#!$%\^&\*;:{}=_`~()\[\]?"']/g, ' ')
+        .replace(/[\s\u3000]+/g, ' ')
+        .trim();
+}
+
+function checkMeaningAnswer(input: string, meaningId: string): boolean {
+    const normalizedInput = normalizeMeaningText(input);
+    if (!normalizedInput) return false;
+
+    const fullTarget = normalizeMeaningText(meaningId);
+    if (!fullTarget) return false;
+
+    if (normalizedInput === fullTarget) return true;
+
+    const parts = meaningId
+        .split(/[;,\/]|\batau\b/i)
+        .map((part) => normalizeMeaningText(part))
+        .filter(Boolean);
+
+    return parts.some((part) => part === normalizedInput);
+}
+
 function checkEssayAnswer(input: string, vocab: Vocabulary): boolean {
     const trimmedRaw = input.trim();
     if (!trimmedRaw) return false;
 
-    const canonicalInput = toCanonicalRomaji(trimmedRaw);
-    const shortInput = collapseLongVowels(canonicalInput);
-    const targetKeys = getRomajiComparisonKeys(vocab.romaji || '');
+    const itemHasKanji = Boolean(vocab.kanji && vocab.kanji.trim().length > 0);
 
-    if (targetKeys.has(canonicalInput) || targetKeys.has(shortInput)) {
-        return true;
-    }
+    if (itemHasKanji) {
+        const canonicalInput = toCanonicalRomaji(trimmedRaw);
+        const shortInput = collapseLongVowels(canonicalInput);
+        const targetKeys = getRomajiComparisonKeys(vocab.romaji || '');
 
-    const normalizedKanaInput = normalizeSpaces(trimmedRaw);
-    const normalizedKanaTarget = normalizeSpaces(vocab.kana || '');
-    return normalizedKanaTarget.length > 0 && normalizedKanaInput === normalizedKanaTarget;
-}
-
-function shuffleArray<T>(items: T[]): T[] {
-    const arr = [...items];
-    for (let i = arr.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    return arr;
-}
-
-function getPromptFontSize(text: string): string {
-    const len = text.trim().length;
-    if (len <= 2) return 'text-8xl leading-none';
-    if (len <= 5) return 'text-6xl leading-tight';
-    if (len <= 10) return 'text-4xl leading-snug';
-    return 'text-2xl leading-relaxed';
-}
-
-const COMPLETED_CHAPTERS_KEY = 'minnamaster_completed_chapters';
-
-function markChapterCompleted(chapterId?: string) {
-    if (!chapterId) return;
-    try {
-        const raw = localStorage.getItem(COMPLETED_CHAPTERS_KEY);
-        const parsed: string[] = raw ? JSON.parse(raw) : [];
-        if (!parsed.includes(chapterId)) {
-            localStorage.setItem(COMPLETED_CHAPTERS_KEY, JSON.stringify([...parsed, chapterId]));
+        if (targetKeys.has(canonicalInput) || targetKeys.has(shortInput)) {
+            return true;
         }
-    } catch {
-        // Abaikan jika penyimpanan lokal tidak tersedia
+
+        const normalizedKanaInput = normalizeSpaces(trimmedRaw);
+        const normalizedKanaTarget = normalizeSpaces(vocab.kana || '');
+        return normalizedKanaTarget.length > 0 && normalizedKanaInput === normalizedKanaTarget;
     }
+
+    return checkMeaningAnswer(trimmedRaw, vocab.meaning_id || '');
 }
 
 function getTimeThresholds(vocab: { romaji?: string; kana?: string }): {
@@ -138,7 +174,7 @@ export default function TesEsai() {
     const [inputText, setInputText] = useState('');
     const [results, setResults] = useState<TestResult[]>([]);
     const [isFinished, setIsFinished] = useState(false);
-    const [feedback, setFeedback] = useState<FeedbackState | null>(null);
+    const [feedback, setFeedback] = useState<EssayFeedback | null>(null);
 
     const startTimeRef = useRef<number>(0);
     const nextBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -147,8 +183,8 @@ export default function TesEsai() {
         async function fetchVocab() {
             setLoading(true);
             setIsFinished(false);
-            setFeedback(null);
             setResults([]);
+            setFeedback(null);
             setInputText('');
 
             const { data, error } = await supabase
@@ -157,13 +193,14 @@ export default function TesEsai() {
                 .eq('chapter_id', chapterId);
 
             if (!error && data) {
-                setQueue(shuffleArray(data));
+                setQueue(shuffleArray(data as Vocabulary[]));
                 startTimeRef.current = Date.now();
             } else {
                 setQueue([]);
             }
             setLoading(false);
         }
+
         fetchVocab();
     }, [chapterId]);
 
@@ -185,7 +222,6 @@ export default function TesEsai() {
         const wasKanji = hasKanji(currentVocab);
 
         const isCorrect = checkEssayAnswer(inputText, currentVocab);
-
         const { fastLimit, slowLimit } = getTimeThresholds(currentVocab);
 
         let status: TestResult['status'] = 'Salah';
@@ -193,26 +229,14 @@ export default function TesEsai() {
             if (timeSpent <= fastLimit) status = 'Cepat';
             else if (timeSpent <= slowLimit) status = 'Lambat';
             else status = 'Sangat Lambat';
-
-            setResults((prev) => {
-                const existingIndex = prev.findIndex((r) => r.vocab.id === currentVocab.id);
-                if (existingIndex >= 0) return prev;
-                return [...prev, { vocab: currentVocab, timeSpent, status }];
-            });
-
-            supabase
-                .from('user_progress')
-                .insert([{ vocabulary_id: currentVocab.id, status }])
-                .then(({ error }) => {
-                    if (error) console.error('Gagal menyimpan progres:', error);
-                });
-        } else {
-            supabase
-                .from('user_progress')
-                .insert([{ vocabulary_id: currentVocab.id, status: 'Salah' }])
-                .then();
         }
 
+        supabase
+            .from('user_progress')
+            .insert([{ vocabulary_id: currentVocab.id, status }])
+            .then();
+
+        setResults((prev) => [...prev, { vocab: currentVocab, status, timeSpent }]);
         setFeedback({
             isCorrect,
             status,
@@ -249,47 +273,42 @@ export default function TesEsai() {
     if (loading) {
         return (
             <div className="p-6 text-center mt-20 text-slate-400 font-medium animate-pulse">
-                Menyiapkan Tes Esai...
+                Menyiapkan soal esai...
             </div>
         );
     }
 
     if (isFinished) {
+        const fastCount = results.filter((r) => r.status === 'Cepat').length;
+        const slowCount = results.filter((r) => r.status === 'Lambat' || r.status === 'Sangat Lambat').length;
+
         return (
             <div className="h-full bg-slate-50 flex flex-col p-6 overflow-y-auto">
-                <div className="text-center mt-6 mb-6">
-                    <CheckCircle2 size={64} className="mx-auto text-green-500 mb-3" />
-                    <h2 className="text-3xl font-black text-slate-800">Lulus Bab Ini!</h2>
-                    <p className="text-slate-500 mt-1 text-sm">Semua kosakata berhasil dihafal.</p>
+                <div className="text-center my-8">
+                    <CheckCircle2 size={72} className="text-emerald-500 mx-auto mb-4" />
+                    <h2 className="text-2xl font-black text-slate-800">Lulus Bab Ini!</h2>
+                    <p className="text-slate-500 text-sm mt-1">Semua kosakata berhasil diketik dengan tepat.</p>
                 </div>
 
-                <div className="bg-white rounded-3xl p-5 shadow-sm border border-slate-100 flex-1 overflow-y-auto">
-                    <h3 className="font-bold text-slate-800 mb-3 text-sm">Rekap Kecepatan Ingatan:</h3>
-                    <div className="space-y-2.5">
-                        {results.map((r, i) => (
-                            <div key={i} className="flex justify-between items-center p-3 bg-slate-50 rounded-xl gap-2">
-                                <div className="min-w-0">
-                                    <p className="font-bold text-slate-800 truncate">{r.vocab.kanji || r.vocab.kana}</p>
-                                    <p className="text-xs text-slate-400 truncate">{r.vocab.meaning_id}</p>
-                                </div>
-                                <div
-                                    className={`text-xs font-bold px-3 py-1 rounded-full shrink-0 ${r.status === 'Cepat'
-                                        ? 'bg-green-100 text-green-700'
-                                        : r.status === 'Lambat'
-                                            ? 'bg-orange-100 text-orange-700'
-                                            : 'bg-red-100 text-red-700'
-                                        }`}
-                                >
-                                    {r.status} ({r.timeSpent.toFixed(1)}s)
-                                </div>
-                            </div>
-                        ))}
+                <div className="bg-white rounded-3xl p-5 shadow-sm border border-slate-100 mb-6 space-y-3">
+                    <div className="flex justify-between items-center text-sm">
+                        <span className="text-slate-500 font-medium">Ingatan Cepat</span>
+                        <span className="font-bold text-emerald-600 bg-emerald-50 px-3 py-1 rounded-full">
+                            {fastCount} kata
+                        </span>
+                    </div>
+                    <div className="flex justify-between items-center text-sm">
+                        <span className="text-slate-500 font-medium">Perlu Review (Lambat)</span>
+                        <span className="font-bold text-amber-600 bg-amber-50 px-3 py-1 rounded-full">
+                            {slowCount} kata
+                        </span>
                     </div>
                 </div>
 
                 <button
+                    type="button"
                     onClick={() => navigate('/')}
-                    className="mt-5 w-full bg-blue-600 text-white font-bold py-4 rounded-2xl hover:bg-blue-700 active:scale-95 transition-all shrink-0"
+                    className="mt-auto w-full bg-blue-600 text-white font-bold py-4 rounded-2xl hover:bg-blue-700 active:scale-95 transition-all"
                 >
                     Kembali ke Beranda
                 </button>
@@ -306,7 +325,8 @@ export default function TesEsai() {
     }
 
     const currentVocab = queue[0];
-    const promptText = hasKanji(currentVocab) ? currentVocab.kanji!.trim() : currentVocab.kana;
+    const currentHasKanji = hasKanji(currentVocab);
+    const promptText = currentHasKanji ? currentVocab.kanji!.trim() : currentVocab.kana;
     const promptFontClass = getPromptFontSize(promptText);
     const isLastRemainingAfterCorrect = feedback?.isCorrect && queue.length === 1;
 
@@ -331,17 +351,17 @@ export default function TesEsai() {
                 </div>
             </div>
 
-            {/* Soal: Hanya Kanji / Hiragana */}
-            <div className="flex-1 flex flex-col justify-center items-center my-4 min-h-[11rem]">
-                <p className="text-slate-400 text-xs font-bold mb-5 uppercase tracking-widest text-center">
-                    Ketik Romaji dari kata ini:
+            {/* Soal */}
+            <div className="flex-1 flex flex-col justify-center items-center my-4 min-h-[10rem] px-2">
+                <p className="text-slate-400 text-xs font-bold mb-4 uppercase tracking-widest text-center">
+                    {currentHasKanji ? 'Ketik bacaan (hiragana / romaji):' : 'Ketik arti bahasa Indonesia:'}
                 </p>
                 <h1 className={`font-black text-slate-800 text-center break-words max-w-full ${promptFontClass}`}>
                     {promptText}
                 </h1>
             </div>
 
-            {/* Hasil / Pembahasan setelah menjawab */}
+            {/* Umpan balik setelah menjawab */}
             {feedback ? (
                 <div
                     className={`p-5 rounded-3xl border mb-4 shadow-sm shrink-0 ${feedback.isCorrect
@@ -349,41 +369,50 @@ export default function TesEsai() {
                         : 'bg-rose-50/90 border-rose-200'
                         }`}
                 >
-                    <div className="flex items-center justify-between mb-3">
-                        <div className="flex items-center gap-2">
-                            {feedback.isCorrect ? (
-                                <CheckCircle2 size={22} className="text-emerald-600 shrink-0" />
-                            ) : (
-                                <XCircle size={22} className="text-rose-600 shrink-0" />
-                            )}
-                            <span
-                                className={`font-extrabold text-base ${feedback.isCorrect ? 'text-emerald-700' : 'text-rose-700'
-                                    }`}
-                            >
-                                {feedback.isCorrect
-                                    ? `Benar! (${feedback.status} • ${feedback.timeSpent.toFixed(1)}s)`
-                                    : 'Salah! Akan diulang di akhir'}
-                            </span>
-                        </div>
+                    <div className="flex items-center gap-2 mb-3">
+                        {feedback.isCorrect ? (
+                            <CheckCircle2 size={22} className="text-emerald-600 shrink-0" />
+                        ) : (
+                            <XCircle size={22} className="text-rose-600 shrink-0" />
+                        )}
+                        <span
+                            className={`font-extrabold text-sm ${feedback.isCorrect ? 'text-emerald-700' : 'text-rose-700'
+                                }`}
+                        >
+                            {feedback.isCorrect
+                                ? `Benar! (${feedback.status} • ${feedback.timeSpent.toFixed(1)}s)`
+                                : 'Salah! Akan diulang di akhir'}
+                        </span>
                     </div>
 
                     <div className="bg-white/80 rounded-2xl p-3.5 space-y-1.5 text-sm">
-                        <div className="flex justify-between gap-2">
-                            <span className="text-slate-400 font-medium">Romaji:</span>
-                            <span className="font-bold text-slate-800 text-right">{feedback.vocab.romaji || '-'}</span>
-                        </div>
-
-                        {feedback.wasKanji && (
-                            <div className="flex justify-between gap-2">
-                                <span className="text-slate-400 font-medium">Bacaan:</span>
-                                <span className="font-bold text-blue-600 text-right">{feedback.vocab.kana}</span>
-                            </div>
+                        {feedback.wasKanji ? (
+                            <>
+                                <div className="flex justify-between gap-2">
+                                    <span className="text-slate-400 font-medium">Bacaan:</span>
+                                    <span className="font-bold text-blue-600 text-right">{feedback.vocab.kana}</span>
+                                </div>
+                                <div className="flex justify-between gap-2">
+                                    <span className="text-slate-400 font-medium">Romaji:</span>
+                                    <span className="font-bold text-slate-800 text-right">{feedback.vocab.romaji || '-'}</span>
+                                </div>
+                                <div className="flex justify-between gap-2">
+                                    <span className="text-slate-400 font-medium shrink-0">Arti:</span>
+                                    <span className="font-bold text-slate-800 text-right">{feedback.vocab.meaning_id}</span>
+                                </div>
+                            </>
+                        ) : (
+                            <>
+                                <div className="flex justify-between gap-2">
+                                    <span className="text-slate-400 font-medium shrink-0">Arti:</span>
+                                    <span className="font-bold text-emerald-700 text-right">{feedback.vocab.meaning_id}</span>
+                                </div>
+                                <div className="flex justify-between gap-2">
+                                    <span className="text-slate-400 font-medium">Romaji:</span>
+                                    <span className="font-bold text-slate-800 text-right">{feedback.vocab.romaji || '-'}</span>
+                                </div>
+                            </>
                         )}
-
-                        <div className="flex justify-between gap-2">
-                            <span className="text-slate-400 font-medium shrink-0">Arti:</span>
-                            <span className="font-bold text-slate-800 text-right">{feedback.vocab.meaning_id}</span>
-                        </div>
                     </div>
 
                     <button
@@ -395,7 +424,7 @@ export default function TesEsai() {
                             : 'bg-slate-800 hover:bg-slate-900'
                             }`}
                     >
-                        <span>{isLastRemainingAfterCorrect ? 'Lihat Rekap' : 'Lanjut'}</span>
+                        <span>{isLastRemainingAfterCorrect ? 'Selesaikan Bab' : 'Lanjut'}</span>
                         <ArrowRight size={18} />
                     </button>
                 </div>
@@ -406,7 +435,11 @@ export default function TesEsai() {
                             type="text"
                             value={inputText}
                             onChange={(e) => setInputText(e.target.value)}
-                            placeholder="Ketik romaji (cth: watashi)..."
+                            placeholder={
+                                currentHasKanji
+                                    ? 'Ketik hiragana atau romaji...'
+                                    : 'Ketik arti bahasa Indonesia...'
+                            }
                             className="w-full bg-white border-2 border-slate-200 p-4 pr-16 rounded-2xl text-lg font-bold text-slate-800 focus:border-blue-600 focus:outline-none transition-colors shadow-sm"
                             autoFocus
                             autoComplete="off"

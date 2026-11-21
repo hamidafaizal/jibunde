@@ -25,6 +25,102 @@ interface ReviewFeedback {
     wasKanji: boolean;
 }
 
+type ReviewStage = 'pagi' | 'siang' | 'sore' | 'malam';
+
+interface VocabTurnMeta {
+    stage: ReviewStage;
+    turn: number;
+}
+
+interface ReviewRotationStore {
+    counter: number;
+    items: Record<string, VocabTurnMeta>;
+}
+
+const REVIEW_STORE_KEY = 'minnamaster_review_rotation_v1';
+
+function loadRotationStore(): ReviewRotationStore {
+    try {
+        const raw = localStorage.getItem(REVIEW_STORE_KEY);
+        if (!raw) return { counter: 0, items: {} };
+        const parsed = JSON.parse(raw);
+        return {
+            counter: typeof parsed?.counter === 'number' ? parsed.counter : 0,
+            items: parsed?.items && typeof parsed.items === 'object' ? parsed.items : {},
+        };
+    } catch {
+        return { counter: 0, items: {} };
+    }
+}
+
+function saveRotationStore(store: ReviewRotationStore) {
+    try {
+        localStorage.setItem(REVIEW_STORE_KEY, JSON.stringify(store));
+    } catch {
+        // Abaikan jika penyimpanan lokal tidak tersedia
+    }
+}
+
+function defaultStageFromStatus(status: string): ReviewStage {
+    if (status === 'Salah' || status === 'Sangat Lambat') return 'pagi';
+    if (status === 'Lambat') return 'sore';
+    return 'malam';
+}
+
+function getNextStage(currentStage: ReviewStage, newStatus: string): ReviewStage {
+    const isWeakOrVerySlow = newStatus === 'Salah' || newStatus === 'Sangat Lambat';
+    if (isWeakOrVerySlow) return 'pagi';
+
+    if (currentStage === 'pagi') {
+        return 'siang';
+    }
+
+    if (currentStage === 'siang') {
+        return newStatus === 'Cepat' ? 'malam' : 'sore';
+    }
+
+    if (currentStage === 'sore') {
+        return newStatus === 'Cepat' ? 'malam' : 'sore';
+    }
+
+    // currentStage === 'malam'
+    return newStatus === 'Cepat' ? 'malam' : 'sore';
+}
+
+function shuffleArray<T>(items: T[]): T[] {
+    const arr = [...items];
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+function buildRollingQueue(
+    items: ReviewQueueItem[],
+    store: ReviewRotationStore
+): ReviewQueueItem[] {
+    const byTurn = new Map<number, ReviewQueueItem[]>();
+
+    items.forEach((item) => {
+        const meta = store.items[item.vocabularies.id];
+        const turn = meta ? meta.turn : 0;
+        const group = byTurn.get(turn) || [];
+        group.push(item);
+        byTurn.set(turn, group);
+    });
+
+    const sortedTurns = Array.from(byTurn.keys()).sort((a, b) => a - b);
+    const ordered: ReviewQueueItem[] = [];
+
+    sortedTurns.forEach((turn) => {
+        const group = byTurn.get(turn) || [];
+        ordered.push(...shuffleArray(group));
+    });
+
+    return ordered.slice(0, 20);
+}
+
 function normalizeSpaces(text: string): string {
     return text.replace(/[\s\u3000]+/g, '').trim();
 }
@@ -66,30 +162,55 @@ function getRomajiComparisonKeys(romaji: string): Set<string> {
     return keys;
 }
 
-function checkReviewAnswer(input: string, vocab: { romaji?: string; kana?: string }): boolean {
+function normalizeMeaningText(text: string): string {
+    return text
+        .toLowerCase()
+        .replace(/[（(][^）)]*[）)]/g, ' ')
+        .replace(/[~〜]/g, ' ')
+        .replace(/-/g, ' ')
+        .replace(/[.,\/#!$%\^&\*;:{}=_`~()\[\]?"']/g, ' ')
+        .replace(/[\s\u3000]+/g, ' ')
+        .trim();
+}
+
+function checkMeaningAnswer(input: string, meaningId: string): boolean {
+    const normalizedInput = normalizeMeaningText(input);
+    if (!normalizedInput) return false;
+
+    const fullTarget = normalizeMeaningText(meaningId);
+    if (!fullTarget) return false;
+
+    if (normalizedInput === fullTarget) return true;
+
+    const parts = meaningId
+        .split(/[;,\/]|\batau\b/i)
+        .map((part) => normalizeMeaningText(part))
+        .filter(Boolean);
+
+    return parts.some((part) => part === normalizedInput);
+}
+
+function checkReviewAnswer(input: string, vocab: VocabItem): boolean {
     const trimmedRaw = input.trim();
     if (!trimmedRaw) return false;
 
-    const canonicalInput = toCanonicalRomaji(trimmedRaw);
-    const shortInput = collapseLongVowels(canonicalInput);
-    const targetKeys = getRomajiComparisonKeys(vocab.romaji || '');
+    const itemHasKanji = Boolean(vocab.kanji && vocab.kanji.trim().length > 0);
 
-    if (targetKeys.has(canonicalInput) || targetKeys.has(shortInput)) {
-        return true;
+    if (itemHasKanji) {
+        const canonicalInput = toCanonicalRomaji(trimmedRaw);
+        const shortInput = collapseLongVowels(canonicalInput);
+        const targetKeys = getRomajiComparisonKeys(vocab.romaji || '');
+
+        if (targetKeys.has(canonicalInput) || targetKeys.has(shortInput)) {
+            return true;
+        }
+
+        const normalizedKanaInput = normalizeSpaces(trimmedRaw);
+        const normalizedKanaTarget = normalizeSpaces(vocab.kana || '');
+        return normalizedKanaTarget.length > 0 && normalizedKanaInput === normalizedKanaTarget;
     }
 
-    const normalizedKanaInput = normalizeSpaces(trimmedRaw);
-    const normalizedKanaTarget = normalizeSpaces(vocab.kana || '');
-    return normalizedKanaTarget.length > 0 && normalizedKanaInput === normalizedKanaTarget;
-}
-
-function getPromptFontSize(text: string): string {
-    const len = text.trim().length;
-    if (len <= 2) return 'text-7xl leading-none';
-    if (len <= 5) return 'text-5xl leading-tight';
-    if (len <= 10) return 'text-3xl leading-snug';
-    if (len <= 18) return 'text-2xl leading-relaxed';
-    return 'text-xl leading-relaxed';
+    return checkMeaningAnswer(trimmedRaw, vocab.meaning_id || '');
 }
 
 function getTimeThresholds(vocab: { romaji?: string; kana?: string }): {
@@ -104,6 +225,15 @@ function getTimeThresholds(vocab: { romaji?: string; kana?: string }): {
         fastLimit: 6 + bonusSeconds,
         slowLimit: 12 + bonusSeconds,
     };
+}
+
+function getPromptFontSize(text: string): string {
+    const len = text.trim().length;
+    if (len <= 2) return 'text-7xl leading-none';
+    if (len <= 5) return 'text-5xl leading-tight';
+    if (len <= 10) return 'text-3xl leading-snug';
+    if (len <= 18) return 'text-2xl leading-relaxed';
+    return 'text-xl leading-relaxed';
 }
 
 export default function SesiReview() {
@@ -139,21 +269,24 @@ export default function SesiReview() {
                     }
                 });
 
-                let filtered: ReviewQueueItem[] = [];
+                const store = loadRotationStore();
+                const activeSession: ReviewStage =
+                    waktu === 'siang' || waktu === 'sore' || waktu === 'malam' ? waktu : 'pagi';
+
+                const matched: ReviewQueueItem[] = [];
                 latestProgress.forEach((item) => {
-                    if ((waktu === 'pagi' || waktu === 'siang') && item.status === 'Salah') {
-                        filtered.push(item);
-                    } else if (waktu === 'sore' && (item.status === 'Lambat' || item.status === 'Sangat Lambat')) {
-                        filtered.push(item);
-                    } else if (waktu === 'malam' && item.status === 'Cepat') {
-                        filtered.push(item);
+                    const vocabId = item.vocabularies.id;
+                    const existingMeta = store.items[vocabId];
+                    const stage = existingMeta ? existingMeta.stage : defaultStageFromStatus(item.status);
+
+                    if (stage === activeSession) {
+                        matched.push(item);
                     }
                 });
 
-                filtered = filtered.sort(() => 0.5 - Math.random()).slice(0, 20);
-
-                setQueue(filtered);
-                if (filtered.length > 0) {
+                const rollingQueue = buildRollingQueue(matched, store);
+                setQueue(rollingQueue);
+                if (rollingQueue.length > 0) {
                     startTimeRef.current = Date.now();
                 }
             }
@@ -181,10 +314,8 @@ export default function SesiReview() {
         const wasKanji = hasKanji(currentVocab);
 
         const isCorrect = checkReviewAnswer(inputText, currentVocab);
-
         const { fastLimit, slowLimit } = getTimeThresholds(currentVocab);
 
-        // LOGIKA OPSI B: KENAIKAN BERTAHAP
         let newStatus = 'Salah';
         if (isCorrect) {
             if (timeSpent <= fastLimit) {
@@ -199,6 +330,21 @@ export default function SesiReview() {
                 newStatus = 'Sangat Lambat';
             }
         }
+
+        const activeSession: ReviewStage =
+            waktu === 'siang' || waktu === 'sore' || waktu === 'malam' ? waktu : 'pagi';
+
+        const store = loadRotationStore();
+        const currentStage = store.items[currentVocab.id]?.stage ?? activeSession;
+        const nextStage = getNextStage(currentStage, newStatus);
+        const nextTurn = store.counter + 1;
+
+        store.counter = nextTurn;
+        store.items[currentVocab.id] = {
+            stage: nextStage,
+            turn: nextTurn,
+        };
+        saveRotationStore(store);
 
         supabase
             .from('user_progress')
@@ -252,6 +398,7 @@ export default function SesiReview() {
                 <h2 className="text-3xl font-black text-slate-800 mb-2">Sesi Selesai!</h2>
                 <p className="text-slate-500 mb-8 text-center">Memori jangka panjangmu semakin kuat.</p>
                 <button
+                    type="button"
                     onClick={() => navigate('/review')}
                     className="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl hover:bg-blue-700 active:scale-95 transition-all"
                 >
@@ -262,7 +409,8 @@ export default function SesiReview() {
     }
 
     const currentVocab = queue[0].vocabularies;
-    const promptText = hasKanji(currentVocab) ? currentVocab.kanji!.trim() : currentVocab.kana;
+    const currentHasKanji = hasKanji(currentVocab);
+    const promptText = currentHasKanji ? currentVocab.kanji!.trim() : currentVocab.kana;
     const promptFontClass = getPromptFontSize(promptText);
     const isLastRemaining = queue.length === 1;
 
@@ -287,10 +435,10 @@ export default function SesiReview() {
                 </div>
             </div>
 
-            {/* Soal: Hanya Kanji / Hiragana dengan ukuran dinamis */}
+            {/* Soal */}
             <div className="flex-1 flex flex-col justify-center items-center my-4 min-h-[10rem] px-2">
                 <p className="text-slate-400 text-xs font-bold mb-4 uppercase tracking-widest text-center">
-                    Apa romajinya?
+                    {currentHasKanji ? 'Ketik bacaan (hiragana / romaji):' : 'Ketik arti bahasa Indonesia:'}
                 </p>
                 <h1 className={`font-black text-slate-800 text-center break-words max-w-full ${promptFontClass}`}>
                     {promptText}
@@ -301,8 +449,8 @@ export default function SesiReview() {
             {feedback ? (
                 <div
                     className={`p-5 rounded-3xl border mb-4 shadow-sm shrink-0 ${feedback.isCorrect
-                        ? 'bg-emerald-50/90 border-emerald-200'
-                        : 'bg-rose-50/90 border-rose-200'
+                            ? 'bg-emerald-50/90 border-emerald-200'
+                            : 'bg-rose-50/90 border-rose-200'
                         }`}
                 >
                     <div className="flex items-center gap-2 mb-3">
@@ -317,27 +465,38 @@ export default function SesiReview() {
                         >
                             {feedback.isCorrect
                                 ? `Benar! (${feedback.newStatus} • ${feedback.timeSpent.toFixed(1)}s)`
-                                : "Salah! Status turun menjadi 'Salah'"}
+                                : "Salah! Masuk kembali ke Sesi Pagi"}
                         </span>
                     </div>
 
                     <div className="bg-white/80 rounded-2xl p-3.5 space-y-1.5 text-sm">
-                        <div className="flex justify-between gap-2">
-                            <span className="text-slate-400 font-medium">Romaji:</span>
-                            <span className="font-bold text-slate-800 text-right">{feedback.vocab.romaji || '-'}</span>
-                        </div>
-
-                        {feedback.wasKanji && (
-                            <div className="flex justify-between gap-2">
-                                <span className="text-slate-400 font-medium">Bacaan:</span>
-                                <span className="font-bold text-blue-600 text-right">{feedback.vocab.kana}</span>
-                            </div>
+                        {feedback.wasKanji ? (
+                            <>
+                                <div className="flex justify-between gap-2">
+                                    <span className="text-slate-400 font-medium">Bacaan:</span>
+                                    <span className="font-bold text-blue-600 text-right">{feedback.vocab.kana}</span>
+                                </div>
+                                <div className="flex justify-between gap-2">
+                                    <span className="text-slate-400 font-medium">Romaji:</span>
+                                    <span className="font-bold text-slate-800 text-right">{feedback.vocab.romaji || '-'}</span>
+                                </div>
+                                <div className="flex justify-between gap-2">
+                                    <span className="text-slate-400 font-medium shrink-0">Arti:</span>
+                                    <span className="font-bold text-slate-800 text-right">{feedback.vocab.meaning_id}</span>
+                                </div>
+                            </>
+                        ) : (
+                            <>
+                                <div className="flex justify-between gap-2">
+                                    <span className="text-slate-400 font-medium shrink-0">Arti:</span>
+                                    <span className="font-bold text-emerald-700 text-right">{feedback.vocab.meaning_id}</span>
+                                </div>
+                                <div className="flex justify-between gap-2">
+                                    <span className="text-slate-400 font-medium">Romaji:</span>
+                                    <span className="font-bold text-slate-800 text-right">{feedback.vocab.romaji || '-'}</span>
+                                </div>
+                            </>
                         )}
-
-                        <div className="flex justify-between gap-2">
-                            <span className="text-slate-400 font-medium shrink-0">Arti:</span>
-                            <span className="font-bold text-slate-800 text-right">{feedback.vocab.meaning_id}</span>
-                        </div>
                     </div>
 
                     <button
@@ -345,8 +504,8 @@ export default function SesiReview() {
                         type="button"
                         onClick={handleContinue}
                         className={`mt-4 w-full py-3.5 px-5 rounded-2xl font-bold text-white flex items-center justify-center gap-2 transition-all active:scale-95 ${feedback.isCorrect
-                            ? 'bg-emerald-600 hover:bg-emerald-700'
-                            : 'bg-slate-800 hover:bg-slate-900'
+                                ? 'bg-emerald-600 hover:bg-emerald-700'
+                                : 'bg-slate-800 hover:bg-slate-900'
                             }`}
                     >
                         <span>{isLastRemaining ? 'Selesaikan Sesi' : 'Lanjut'}</span>
@@ -360,7 +519,11 @@ export default function SesiReview() {
                             type="text"
                             value={inputText}
                             onChange={(e) => setInputText(e.target.value)}
-                            placeholder="Ketik romaji..."
+                            placeholder={
+                                currentHasKanji
+                                    ? 'Ketik hiragana atau romaji...'
+                                    : 'Ketik arti bahasa Indonesia...'
+                            }
                             className="w-full bg-white border-2 border-slate-200 p-4 pr-16 rounded-2xl text-lg font-bold text-slate-800 focus:border-blue-600 focus:outline-none transition-colors shadow-sm"
                             autoFocus
                             autoComplete="off"
